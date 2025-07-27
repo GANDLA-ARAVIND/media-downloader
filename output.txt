@@ -1,0 +1,3220 @@
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components ===
+[Error reading file]: [Errno 13] Permission denied: 'C:\\Users\\Dell\\Downloads\\yt-downloader-sucess\\project\\src\\components'
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\server ===
+[Error reading file]: [Errno 13] Permission denied: 'C:\\Users\\Dell\\Downloads\\yt-downloader-sucess\\project\\server'
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\server\downloads ===
+[Error reading file]: [Errno 13] Permission denied: 'C:\\Users\\Dell\\Downloads\\yt-downloader-sucess\\project\\server\\downloads'
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\server\cookies.txt ===
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\server\index.cjs ===
+const express = require('express');
+const cors = require('cors');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors({
+  origin: process.env.ORIGIN || 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json());
+app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
+
+const downloadsDir = path.join(__dirname, 'downloads');
+if (!fs.existsSync(downloadsDir)) {
+  fs.mkdirSync(downloadsDir, { recursive: true });
+}
+
+app.use('/download-file', express.static(downloadsDir));
+
+const downloads = new Map();
+
+function extractVideoId(url) {
+  const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
+  const match = url.match(regex);
+  return match ? match[1] : null;
+}
+
+function getVideoInfo(url) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '--dump-json',
+      '--no-download',
+      '--no-playlist',
+      '--no-warnings',
+      url
+    ];
+
+    const ytdlp = spawn('yt-dlp', args);
+
+    let data = '';
+    let error = '';
+
+    ytdlp.stdout.on('data', (chunk) => {
+      data += chunk.toString();
+    });
+
+    ytdlp.stderr.on('data', (chunk) => {
+      error += chunk.toString();
+    });
+
+    ytdlp.on('close', (code) => {
+      if (code === 0) {
+        try {
+          const info = JSON.parse(data);
+          const formats = info.formats || [];
+          const availableQualities = [];
+          
+          formats.forEach(format => {
+            if (format.height && format.vcodec !== 'none') {
+              const quality = `${format.height}p`;
+              if (!availableQualities.includes(quality)) {
+                availableQualities.push(quality);
+              }
+            }
+          });
+          
+          availableQualities.sort((a, b) => {
+            const aNum = parseInt(a.replace('p', ''));
+            const bNum = parseInt(b.replace('p', ''));
+            return aNum - bNum;
+          });
+          
+          resolve({
+            title: info.title || 'Unknown Title',
+            duration: formatDuration(info.duration || 0),
+            views: formatNumber(info.view_count || 0),
+            author: info.uploader || info.channel || 'Unknown Author',
+            thumbnail: info.thumbnail || '',
+            likes: formatNumber(info.like_count || 0),
+            comments: formatNumber(info.comment_count || 0),
+            description: info.description || '',
+            upload_date: info.upload_date || '',
+            tags: info.tags || [],
+            availableQualities: availableQualities.length > 0 ? availableQualities : ['360p', '720p', '1080p']
+          });
+        } catch (e) {
+          console.error('Error parsing video info:', e);
+          reject(new Error('Failed to parse video info'));
+        }
+      } else {
+        console.error('yt-dlp error:', error);
+        if (error.includes('HTTP Error 403')) {
+          reject(new Error('Access denied: Video may be private or restricted'));
+        } else if (error.includes('fragment not found')) {
+          reject(new Error('Video fragments unavailable: The video may be private or removed'));
+        } else {
+          reject(new Error(error || 'Failed to get video info'));
+        }
+      }
+    });
+  });
+}
+
+function formatDuration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, '0')}`;
+}
+
+function formatNumber(num) {
+  if (num >= 1000000) {
+    return (num / 1000000).toFixed(1) + 'M';
+  }
+  if (num >= 1000) {
+    return (num / 1000).toFixed(1) + 'K';
+  }
+  return num.toString();
+}
+
+app.post('/api/video-info', async (req, res) => {
+  try {
+    const { url } = req.body;
+    
+    if (!url) {
+      return res.status(400).json({ error: 'URL is required' });
+    }
+
+    const videoInfo = await getVideoInfo(url);
+    res.json(videoInfo);
+  } catch (error) {
+    console.error('Error getting video info:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/download', async (req, res) => {
+  try {
+    const { url, quality, audioOnly } = req.body;
+    
+    if (!url) {
+      return res.status(400).json({ error: 'URL is required' });
+    }
+
+    const downloadId = uuidv4();
+    const videoInfo = await getVideoInfo(url);
+    
+    downloads.set(downloadId, {
+      id: downloadId,
+      url,
+      title: videoInfo.title,
+      quality,
+      audioOnly,
+      status: 'pending',
+      progress: 0,
+      timestamp: new Date(),
+      thumbnail: videoInfo.thumbnail,
+      duration: videoInfo.duration,
+      fileSize: null,
+      filePath: null,
+      analyticsData: null,
+      errorMessage: null
+    });
+
+    downloadVideo(downloadId, url, quality, audioOnly, videoInfo);
+    
+    res.json({ downloadId, ...downloads.get(downloadId) });
+  } catch (error) {
+    console.error('Error starting download:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/download/:id', (req, res) => {
+  const { id } = req.params;
+  const download = downloads.get(id);
+  
+  if (!download) {
+    return res.status(404).json({ error: 'Download not found' });
+  }
+  
+  res.json(download);
+});
+
+app.get('/api/downloads', (req, res) => {
+  const allDownloads = Array.from(downloads.values()).sort((a, b) => 
+    new Date(b.timestamp) - new Date(a.timestamp)
+  );
+  res.json(allDownloads);
+});
+
+async function downloadVideo(downloadId, url, quality, audioOnly, videoInfo) {
+  const download = downloads.get(downloadId);
+  
+  try {
+    download.status = 'downloading';
+    downloads.set(downloadId, download);
+
+    const filename = `${downloadId}_${videoInfo.title.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    const extension = audioOnly ? 'mp3' : 'mp4';
+    const outputFilename = `${filename}.${extension}`;
+    const outputPath = path.join(downloadsDir, outputFilename);
+
+    const args = [
+      '--progress',
+      '--newline',
+      '--no-playlist',
+      url,
+      '-o', outputPath
+    ];
+
+    if (audioOnly) {
+      args.push('--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0'); // Best audio quality
+    } else {
+      const formatMap = {
+        '360p': 'bestvideo[height=360][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '720p': 'bestvideo[height=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        '1080p': 'bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+      };
+      args.push('-f', formatMap[quality] || 'bestvideo[height=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best');
+    }
+
+    const ytdlp = spawn('yt-dlp', args);
+
+    ytdlp.stdout.on('data', (data) => {
+      const output = data.toString();
+      const progressMatch = output.match(/(\d+\.?\d*)%/);
+      if (progressMatch) {
+        const progress = parseFloat(progressMatch[1]);
+        download.progress = Math.min(progress, 80);
+        downloads.set(downloadId, download);
+      }
+    });
+
+    ytdlp.stderr.on('data', (data) => {
+      console.error('yt-dlp stderr:', data.toString());
+    });
+
+    ytdlp.on('close', async (code) => {
+      if (code === 0) {
+        download.status = 'analyzing';
+        download.progress = 85;
+        downloads.set(downloadId, download);
+
+        try {
+          const stats = fs.statSync(outputPath);
+          download.fileSize = formatFileSize(stats.size);
+          download.filePath = outputPath;
+          download.downloadUrl = `/download-file/${outputFilename}`;
+        } catch (e) {
+          console.error('Error getting file stats:', e);
+          download.status = 'error';
+          download.errorMessage = 'Failed to access downloaded file';
+          downloads.set(downloadId, download);
+          return;
+        }
+
+        await simulateAnalysis(downloadId);
+        
+        download.status = 'completed';
+        download.progress = 100;
+        downloads.set(downloadId, download);
+      } else {
+        console.error('yt-dlp exited with code:', code);
+        download.status = 'error';
+        if (ytdlp.stderr.toString().includes('HTTP Error 403')) {
+          download.errorMessage = 'Access denied: Video may be private or restricted';
+        } else if (ytdlp.stderr.toString().includes('fragment not found')) {
+          download.errorMessage = 'Video fragments unavailable: The video may be private or removed';
+        } else {
+          download.errorMessage = 'Failed to download video';
+        }
+        downloads.set(downloadId, download);
+      }
+    });
+
+    ytdlp.on('error', (error) => {
+      console.error('Download error:', error);
+      download.status = 'error';
+      download.errorMessage = 'Failed to download video: ' + error.message;
+      downloads.set(downloadId, download);
+    });
+
+  } catch (error) {
+    console.error('Error in downloadVideo:', error);
+    download.status = 'error';
+    download.errorMessage = error.message;
+    downloads.set(downloadId, download);
+  }
+}
+
+async function simulateAnalysis(downloadId) {
+  const download = downloads.get(downloadId);
+  
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  
+  const analyticsData = {
+    sentiment: {
+      positive: Math.floor(Math.random() * 40) + 50,
+      negative: Math.floor(Math.random() * 20) + 5,
+      neutral: Math.floor(Math.random() * 30) + 20
+    },
+    keywords: [
+      'technology', 'tutorial', 'programming', 'web development', 
+      'javascript', 'react', 'coding', 'software'
+    ].slice(0, Math.floor(Math.random() * 4) + 3),
+    transcript: 'This is a sample transcript of the video content.',
+    engagement: {
+      likes: formatNumber(Math.floor(Math.random() * 100000)),
+      views: formatNumber(Math.floor(Math.random() * 1000000)),
+      comments: formatNumber(Math.floor(Math.random() * 10000)),
+      shares: formatNumber(Math.floor(Math.random() * 1000))
+    },
+    topics: ['Technology', 'Education', 'Programming', 'Web Development', 'Tutorial']
+  };
+  
+  download.analyticsData = analyticsData;
+  download.progress = 95;
+  downloads.set(downloadId, download);
+}
+
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+app.post('/api/export', async (req, res) => {
+  try {
+    const { format, downloadId } = req.body;
+    const download = downloads.get(downloadId);
+    
+    if (!download || !download.analyticsData) {
+      return res.status(404).json({ error: 'Download or analytics data not found' });
+    }
+    
+    if (format === 'csv') {
+      const csv = generateCSV(download);
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${download.title}_analytics.csv"`);
+      res.send(csv);
+    } else if (format === 'pdf') {
+      res.json({ message: 'PDF export would be implemented with a PDF library like puppeteer or jsPDF' });
+    }
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function generateCSV(download) {
+  const { analyticsData } = download;
+  let csv = 'Metric,Value\n';
+  csv += `Title,"${download.title}"\n`;
+  csv += `Duration,${download.duration}\n`;
+  csv += `Quality,${download.quality}\n`;
+  csv += `Positive Sentiment,${analyticsData.sentiment.positive}%\n`;
+  csv += `Negative Sentiment,${analyticsData.sentiment.negative}%\n`;
+  csv += `Neutral Sentiment,${analyticsData.sentiment.neutral}%\n`;
+  csv += `Keywords,"${analyticsData.keywords.join(', ')}"\n`;
+  csv += `Topics,"${analyticsData.topics.join(', ')}"\n`;
+  csv += `Likes,${analyticsData.engagement.likes}\n`;
+  csv += `Views,${analyticsData.engagement.views}\n`;
+  csv += `Comments,${analyticsData.engagement.comments}\n`;
+  csv += `Shares,${analyticsData.engagement.shares}\n`;
+  return csv;
+}
+
+app.get('/api/download-file/:downloadId', (req, res) => {
+  const { downloadId } = req.params;
+  const download = downloads.get(downloadId);
+  
+  if (!download || !download.filePath) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  
+  if (!fs.existsSync(download.filePath)) {
+    return res.status(404).json({ error: 'File not found on disk' });
+  }
+  
+  const filename = path.basename(download.filePath);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Content-Type', download.audioOnly ? 'audio/mpeg' : 'video/mp4');
+  res.setHeader('Content-Length', fs.statSync(download.filePath).size);
+  res.sendFile(download.filePath, (err) => {
+    if (err) {
+      console.error('Error sending file:', err);
+      res.status(500).json({ error: 'Failed to send file' });
+    }
+  });
+});
+
+const users = new Map();
+
+app.post('/api/register', (req, res) => {
+  const { name, email, password } = req.body;
+  
+  if (users.has(email)) {
+    return res.status(400).json({ error: 'User already exists' });
+  }
+  
+  const user = {
+    id: uuidv4(),
+    name,
+    email,
+    password,
+    createdAt: new Date()
+  };
+  
+  users.set(email, user);
+  
+  const { password: _, ...userResponse } = user;
+  res.json(userResponse);
+});
+
+app.post('/api/login', (req, res) => {
+  const { email, password } = req.body;
+  
+  const user = users.get(email);
+  if (!user || user.password !== password) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  const { password: _, ...userResponse } = user;
+  res.json(userResponse);
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Make sure you have yt-dlp installed: pip install yt-dlp`);
+});
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src ===
+[Error reading file]: [Errno 13] Permission denied: 'C:\\Users\\Dell\\Downloads\\yt-downloader-sucess\\project\\src'
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\AnalyticsDashboard.tsx ===
+import React from 'react';
+import { TrendingUp, MessageCircle, Heart, Hash, Volume2, FileText, Download, Share2 } from 'lucide-react';
+
+interface AnalyticsData {
+  sentiment: {
+    positive: number;
+    negative: number;
+    neutral: number;
+  };
+  keywords: string[];
+  transcript: string;
+  engagement: {
+    likes: string;
+    views: string;
+    comments: string;
+    shares: string;
+  };
+  topics: string[];
+}
+
+interface AnalyticsDashboardProps {
+  data: AnalyticsData;
+  onExport: (format: 'csv' | 'pdf') => void;
+}
+
+export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ data, onExport }) => {
+  const sentimentTotal = data.sentiment.positive + data.sentiment.negative + data.sentiment.neutral;
+  const positivePercentage = (data.sentiment.positive / sentimentTotal) * 100;
+  const negativePercentage = (data.sentiment.negative / sentimentTotal) * 100;
+  const neutralPercentage = (data.sentiment.neutral / sentimentTotal) * 100;
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-gray-200 dark:border-gray-700">
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center space-x-3">
+          <div className="w-10 h-10 bg-gradient-to-r from-purple-500 to-pink-500 rounded-lg flex items-center justify-center">
+            <TrendingUp className="w-6 h-6 text-white" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white">Video Analytics</h2>
+            <p className="text-gray-600 dark:text-gray-400">AI-powered insights</p>
+          </div>
+        </div>
+        <div className="flex space-x-2">
+          <button
+            onClick={() => onExport('csv')}
+            className="bg-green-500 hover:bg-green-600 text-white p-2 rounded-lg transition-all duration-300 transform hover:scale-105"
+          >
+            <Download className="w-5 h-5" />
+          </button>
+          <button
+            onClick={() => onExport('pdf')}
+            className="bg-red-500 hover:bg-red-600 text-white p-2 rounded-lg transition-all duration-300 transform hover:scale-105"
+          >
+            <FileText className="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div className="bg-gradient-to-r from-blue-500 to-blue-600 rounded-lg p-4 text-white">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-blue-100 text-sm">Views</p>
+              <p className="text-2xl font-bold">{data.engagement.views}</p>
+            </div>
+            <Heart className="w-8 h-8 text-blue-200" />
+          </div>
+        </div>
+        <div className="bg-gradient-to-r from-green-500 to-green-600 rounded-lg p-4 text-white">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-green-100 text-sm">Likes</p>
+              <p className="text-2xl font-bold">{data.engagement.likes}</p>
+            </div>
+            <Heart className="w-8 h-8 text-green-200" />
+          </div>
+        </div>
+        <div className="bg-gradient-to-r from-purple-500 to-purple-600 rounded-lg p-4 text-white">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-purple-100 text-sm">Comments</p>
+              <p className="text-2xl font-bold">{data.engagement.comments}</p>
+            </div>
+            <MessageCircle className="w-8 h-8 text-purple-200" />
+          </div>
+        </div>
+        <div className="bg-gradient-to-r from-orange-500 to-orange-600 rounded-lg p-4 text-white">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-orange-100 text-sm">Shares</p>
+              <p className="text-2xl font-bold">{data.engagement.shares}</p>
+            </div>
+            <Share2 className="w-8 h-8 text-orange-200" />
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <MessageCircle className="w-5 h-5" />
+            <span>Sentiment Analysis</span>
+          </h3>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-600 dark:text-gray-400">Positive</span>
+              <span className="text-sm font-medium text-green-600">{positivePercentage.toFixed(1)}%</span>
+            </div>
+            <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2">
+              <div
+                className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${positivePercentage}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-600 dark:text-gray-400">Negative</span>
+              <span className="text-sm font-medium text-red-600">{negativePercentage.toFixed(1)}%</span>
+            </div>
+            <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2">
+              <div
+                className="bg-red-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${negativePercentage}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-600 dark:text-gray-400">Neutral</span>
+              <span className="text-sm font-medium text-gray-600">{neutralPercentage.toFixed(1)}%</span>
+            </div>
+            <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2">
+              <div
+                className="bg-gray-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${neutralPercentage}%` }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <Hash className="w-5 h-5" />
+            <span>Trending Keywords</span>
+          </h3>
+          <div className="flex flex-wrap gap-2">
+            {data.keywords.map((keyword, index) => (
+              <span
+                key={index}
+                className="bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 px-3 py-1 rounded-full text-sm font-medium"
+              >
+                {keyword}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <TrendingUp className="w-5 h-5" />
+            <span>Topics</span>
+          </h3>
+          <div className="space-y-2">
+            {data.topics.map((topic, index) => (
+              <div key={index} className="flex items-center space-x-2">
+                <div className="w-2 h-2 bg-purple-500 rounded-full" />
+                <span className="text-sm text-gray-700 dark:text-gray-300">{topic}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <Volume2 className="w-5 h-5" />
+            <span>Transcript Preview</span>
+          </h3>
+          <div className="max-h-32 overflow-y-auto">
+            <p className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed">
+              {data.transcript}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\AuthModal.tsx ===
+import React, { useState } from 'react';
+import { X, Mail, Lock, User, Eye, EyeOff } from 'lucide-react';
+import { apiService } from '../services/api';
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  createdAt: string;
+}
+
+interface AuthModalProps {
+  onSuccess: (user: User) => void;
+  onClose: () => void;
+}
+
+export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess, onClose }) => {
+  const [isLogin, setIsLogin] = useState(true);
+  const [showPassword, setShowPassword] = useState(false);
+  const [formData, setFormData] = useState({
+    name: '',
+    email: '',
+    password: ''
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+
+    try {
+      let user: User;
+      
+      if (isLogin) {
+        user = await apiService.login({
+          email: formData.email,
+          password: formData.password
+        });
+      } else {
+        user = await apiService.register({
+          name: formData.name,
+          email: formData.email,
+          password: formData.password
+        });
+      }
+      
+      onSuccess(user);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Authentication failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setError(null);
+    setFormData(prev => ({
+      ...prev,
+      [e.target.name]: e.target.value
+    }));
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 w-full max-w-md shadow-2xl">
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">
+            {isLogin ? 'Welcome Back' : 'Create Account'}
+          </h2>
+          <button
+            onClick={onClose}
+            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+          >
+            <X className="w-5 h-5 text-gray-500" />
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+            <p className="text-red-700 dark:text-red-300 text-sm">{error}</p>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {!isLogin && (
+            <div className="relative">
+              <User className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+              <input
+                type="text"
+                name="name"
+                placeholder="Full Name"
+                value={formData.name}
+                onChange={handleChange}
+                required={!isLogin}
+                className="w-full pl-10 pr-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+              />
+            </div>
+          )}
+
+          <div className="relative">
+            <Mail className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+            <input
+              type="email"
+              name="email"
+              placeholder="Email Address"
+              value={formData.email}
+              onChange={handleChange}
+              required
+              className="w-full pl-10 pr-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+            />
+          </div>
+
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+            <input
+              type={showPassword ? 'text' : 'password'}
+              name="password"
+              placeholder="Password"
+              value={formData.password}
+              onChange={handleChange}
+              required
+              className="w-full pl-10 pr-12 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword(!showPassword)}
+              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+            >
+              {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+            </button>
+          </div>
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 disabled:from-gray-400 disabled:to-gray-400 text-white py-3 rounded-lg font-medium transition-all duration-300 transform hover:scale-105 disabled:scale-100"
+          >
+            {loading ? 'Loading...' : isLogin ? 'Sign In' : 'Create Account'}
+          </button>
+        </form>
+
+        <div className="mt-6 text-center">
+          <p className="text-gray-600 dark:text-gray-400">
+            {isLogin ? "Don't have an account?" : "Already have an account?"}
+            <button
+              onClick={() => setIsLogin(!isLogin)}
+              className="ml-1 text-orange-600 hover:text-orange-700 font-medium"
+            >
+              {isLogin ? 'Sign up' : 'Sign in'}
+            </button>
+          </p>
+        </div>
+
+        <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-600">
+          <p className="text-xs text-gray-500 dark:text-gray-400 text-center">
+            By continuing, you agree to our Terms of Service and Privacy Policy
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\BatchDownloader.tsx ===
+import React, { useState, useEffect } from 'react';
+import { Plus, Trash2, Download, FileAudio, Clock, Eye, Heart, MessageCircle } from 'lucide-react';
+import { apiService, VideoInfo } from '../services/api';
+
+interface BatchItem {
+  id: string;
+  url: string;
+  quality: string;
+  audioOnly: boolean;
+  status: 'pending' | 'downloading' | 'completed' | 'error';
+  progress: number;
+  videoInfo?: VideoInfo | null;
+  analyzeError?: string | null;
+  isAnalyzing?: boolean;
+  downloadId?: string | null;
+}
+
+interface BatchDownloaderProps {
+  onBatchDownload: (items: BatchItem[]) => void;
+  onDownloadComplete: () => void;
+}
+
+export const BatchDownloader: React.FC<BatchDownloaderProps> = ({ onBatchDownload, onDownloadComplete }) => {
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([
+    { id: crypto.randomUUID(), url: '', quality: '720p', audioOnly: false, status: 'pending', progress: 0 },
+  ]);
+
+  const isValidUrl = (url: string) => {
+    return url.includes('youtube.com') || url.includes('youtu.be');
+  };
+
+  useEffect(() => {
+    const analyzeUrl = async (item: BatchItem, index: number) => {
+      if (!item.url || !isValidUrl(item.url)) {
+        setBatchItems(prev => {
+          const newItems = [...prev];
+          newItems[index] = { ...newItems[index], videoInfo: null, analyzeError: null, isAnalyzing: false };
+          return newItems;
+        });
+        return;
+      }
+
+      setBatchItems(prev => {
+        const newItems = [...prev];
+        newItems[index] = { ...newItems[index], isAnalyzing: true, analyzeError: null, videoInfo: null };
+        return newItems;
+      });
+
+      try {
+        const info = await apiService.getVideoInfo(item.url);
+        setBatchItems(prev => {
+          const newItems = [...prev];
+          newItems[index] = {
+            ...newItems[index],
+            videoInfo: info,
+            quality: info.availableQualities && info.availableQualities.length > 0
+              ? info.availableQualities[info.availableQualities.length - 1]
+              : '720p',
+            isAnalyzing: false,
+          };
+          return newItems;
+        });
+      } catch (err) {
+        setBatchItems(prev => {
+          const newItems = [...prev];
+          newItems[index] = {
+            ...newItems[index],
+            analyzeError: err instanceof Error ? err.message : 'Failed to analyze video',
+            isAnalyzing: false,
+            videoInfo: null,
+          };
+          return newItems;
+        });
+      }
+    };
+
+    const timeouts = batchItems.map((item, index) => {
+      if (item.url && isValidUrl(item.url)) {
+        return setTimeout(() => analyzeUrl(item, index), 500);
+      }
+      return null;
+    });
+
+    return () => timeouts.forEach(timeout => timeout && clearTimeout(timeout));
+  }, [batchItems.map(item => item.url).join(',')]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout | null = null;
+    let timeout: NodeJS.Timeout | null = null;
+    const activeDownloads = batchItems.filter(item => item.downloadId && item.status === 'downloading');
+
+    if (activeDownloads.length > 0) {
+      console.log('Starting polling for downloads:', activeDownloads.map(item => ({ id: item.id, url: item.url, status: item.status })));
+
+      interval = setInterval(async () => {
+        console.log('Polling cycle. Active downloads:', activeDownloads.map(item => ({ id: item.id, status: item.status, progress: item.progress })));
+        
+        for (const item of activeDownloads) {
+          try {
+            const downloadStatus = await apiService.getDownloadStatus(item.downloadId!);
+            console.log(`Download status for ${item.id}:`, { status: downloadStatus.status, progress: downloadStatus.progress });
+            
+            setBatchItems(prev => {
+              const newItems = [...prev];
+              const index = newItems.findIndex(i => i.id === item.id);
+              newItems[index] = {
+                ...newItems[index],
+                progress: downloadStatus.progress,
+                status: downloadStatus.status,
+              };
+              return newItems;
+            });
+
+            if (downloadStatus.status === 'completed' || downloadStatus.status === 'error') {
+              setBatchItems(prev => {
+                const newItems = [...prev];
+                const index = newItems.findIndex(i => i.id === item.id);
+                newItems[index] = {
+                  ...newItems[index],
+                  downloadId: null,
+                  status: downloadStatus.status,
+                  analyzeError: downloadStatus.status === 'error' ? (downloadStatus.errorMessage ?? 'Download failed') : null,
+                };
+                return newItems;
+              });
+            }
+          } catch (err) {
+            console.error(`Error polling download ${item.id}:`, err);
+            setBatchItems(prev => {
+              const newItems = [...prev];
+              const index = newItems.findIndex(i => i.id === item.id);
+              newItems[index] = {
+                ...newItems[index],
+                status: 'error',
+                downloadId: null,
+                analyzeError: err instanceof Error ? err.message : 'Failed to check download status',
+              };
+              return newItems;
+            });
+          }
+        }
+
+        // Check if all downloads are complete or failed
+        const allDone = batchItems.every(item => item.status === 'completed' || item.status === 'error' || !item.url || !isValidUrl(item.url));
+        console.log('All downloads done?', allDone, 'Batch items:', batchItems.map(item => ({ id: item.id, url: item.url, status: item.status, downloadId: item.downloadId })));
+        
+        if (allDone && activeDownloads.length > 0) {
+          console.log('All downloads completed or failed. Triggering onDownloadComplete.');
+          onDownloadComplete();
+          clearInterval(interval!);
+        }
+      }, 1000);
+
+      // Fallback timeout to force navigation if downloads are stuck
+      timeout = setTimeout(() => {
+        console.log('Timeout triggered. Forcing navigation.');
+        setBatchItems(prev => prev.map(item => 
+          item.status === 'downloading' 
+            ? { ...item, status: 'error', downloadId: null, analyzeError: 'Download timed out' }
+            : item
+        ));
+        console.log('Calling onDownloadComplete due to timeout.');
+        onDownloadComplete();
+      }, 2 * 60 * 1000); // 2 minutes
+    }
+
+    return () => {
+      if (interval) {
+        console.log('Cleaning up polling interval.');
+        clearInterval(interval);
+      }
+      if (timeout) {
+        console.log('Cleaning up timeout.');
+        clearTimeout(timeout);
+      }
+    };
+  }, [batchItems, onDownloadComplete]);
+
+  const addBatchItem = () => {
+    setBatchItems([...batchItems, {
+      id: crypto.randomUUID(),
+      url: '',
+      quality: '720p',
+      audioOnly: false,
+      status: 'pending',
+      progress: 0,
+    }]);
+  };
+
+  const removeBatchItem = (id: string) => {
+    if (batchItems.length > 1) {
+      setBatchItems(batchItems.filter(item => item.id !== id));
+    }
+  };
+
+  const updateBatchItem = (id: string, field: keyof BatchItem, value: any) => {
+    setBatchItems(prev => prev.map(item =>
+      item.id === id ? { ...item, [field]: value } : item
+    ));
+  };
+
+  const handleBatchDownload = async () => {
+    const validItems = batchItems.filter(item => item.url && isValidUrl(item.url));
+    if (validItems.length === 0) {
+      console.log('No valid items to download.');
+      return;
+    }
+
+    console.log('Starting batch download for items:', validItems.map(item => ({ id: item.id, url: item.url })));
+    
+    for (const item of validItems) {
+      try {
+        const downloadResponse = await apiService.downloadVideo({
+          url: item.url,
+          quality: item.quality,
+          audioOnly: item.audioOnly,
+        });
+        setBatchItems(prev => {
+          const newItems = [...prev];
+          const index = newItems.findIndex(i => i.id === item.id);
+          newItems[index] = {
+            ...newItems[index],
+            status: 'downloading',
+            progress: 0,
+            downloadId: downloadResponse.downloadId,
+          };
+          return newItems;
+        });
+      } catch (err) {
+        console.error(`Failed to start download for ${item.url}:`, err);
+        setBatchItems(prev => {
+          const newItems = [...prev];
+          const index = newItems.findIndex(i => i.id === item.id);
+          newItems[index] = {
+            ...newItems[index],
+            status: 'error',
+            analyzeError: err instanceof Error ? err.message : 'Failed to start download',
+          };
+          return newItems;
+        });
+      }
+    }
+
+    onBatchDownload(validItems);
+  };
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-orange-200 dark:border-orange-700">
+      <div className="flex items-center space-x-3 mb-6">
+        <div className="w-10 h-10 bg-gradient-to-r from-orange-500 to-red-600 rounded-lg flex items-center justify-center">
+          <Download className="w-6 h-6 text-white" />
+        </div>
+        <div>
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Batch Downloader</h2>
+          <p className="text-gray-600 dark:text-gray-400">Download multiple YouTube videos</p>
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {batchItems.map((item, index) => (
+          <div key={item.id} className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-medium text-gray-900 dark:text-white">Video {index + 1}</h3>
+              {batchItems.length > 1 && (
+                <button
+                  onClick={() => removeBatchItem(item.id)}
+                  className="text-red-500 hover:text-red-700"
+                >
+                  <Trash2 className="w-5 h-5" />
+                </button>
+              )}
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                  Video URL
+                </label>
+                <input
+                  type="url"
+                  value={item.url}
+                  onChange={(e) => updateBatchItem(item.id, 'url', e.target.value)}
+                  placeholder="Paste YouTube video URL here..."
+                  className="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  disabled={item.status === 'downloading'}
+                />
+              </div>
+
+              {item.isAnalyzing && (
+                <div className="p-3 bg-gray-100 dark:bg-gray-600 rounded-lg">
+                  <p className="text-sm text-gray-600 dark:text-gray-400">Analyzing video...</p>
+                </div>
+              )}
+
+              {item.analyzeError && (
+                <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                  <p className="text-red-700 dark:text-red-300 text-sm">{item.analyzeError}</p>
+                </div>
+              )}
+
+              {item.videoInfo && !item.isAnalyzing && (
+                <div className="p-3 bg-gray-100 dark:bg-gray-600 rounded-lg">
+                  <div className="flex space-x-4">
+                    <img
+                      src={item.videoInfo.thumbnail}
+                      alt={item.videoInfo.title}
+                      className="w-24 h-16 object-cover rounded"
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).src = 'https://images.pexels.com/photos/1181671/pexels-photo-1181671.jpeg?auto=compress&cs=tinysrgb&w=800';
+                      }}
+                    />
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-gray-900 dark:text-white mb-1">{item.videoInfo.title}</h3>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{item.videoInfo.author}</p>
+                      <div className="flex items-center space-x-4 text-xs text-gray-500 dark:text-gray-400">
+                        <div className="flex items-center space-x-1">
+                          <Clock className="w-3 h-3" />
+                          <span>{item.videoInfo.duration}</span>
+                        </div>
+                        <div className="flex items-center space-x-1">
+                          <Eye className="w-3 h-3" />
+                          <span>{item.videoInfo.views}</span>
+                        </div>
+                        <div className="flex items-center space-x-1">
+                          <Heart className="w-3 h-3" />
+                          <span>{item.videoInfo.likes}</span>
+                        </div>
+                        <div className="flex items-center space-x-1">
+                          <MessageCircle className="w-3 h-3" />
+                          <span>{item.videoInfo.comments}</span>
+                        </div>
+                      </div>
+                      {item.videoInfo.availableQualities && (
+                        <div className="mt-2">
+                          <p className="text-xs text-gray-500 dark:text-gray-400">
+                            Available qualities: {item.videoInfo.availableQualities.join(', ')}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-col sm:flex-row gap-4">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                    Quality
+                  </label>
+                  <select
+                    value={item.quality}
+                    onChange={(e) => updateBatchItem(item.id, 'quality', e.target.value)}
+                    disabled={item.status === 'downloading' || item.isAnalyzing}
+                    className="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  >
+                    {item.videoInfo?.availableQualities ? (
+                      item.videoInfo.availableQualities.map(qual => (
+                        <option key={qual} value={qual}>
+                          {qual} {qual === '720p' ? '(HD)' : qual === '1080p' ? '(Full HD)' : qual === '1440p' ? '(2K)' : qual === '2160p' ? '(4K)' : ''}
+                        </option>
+                      ))
+                    ) : (
+                      <>
+                        <option value="360p">360p</option>
+                        <option value="720p">720p (HD)</option>
+                        <option value="1080p">1080p (Full HD)</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                <div className="flex items-center space-x-2 pt-8">
+                  <input
+                    type="checkbox"
+                    id={`audioOnly-${item.id}`}
+                    checked={item.audioOnly}
+                    onChange={(e) => updateBatchItem(item.id, 'audioOnly', e.target.checked)}
+                    disabled={item.status === 'downloading'}
+                    className="w-5 h-5 text-orange-600 rounded focus:ring-orange-500"
+                  />
+                  <label htmlFor={`audioOnly-${item.id}`} className="text-sm text-gray-700 dark:text-gray-300 flex items-center space-x-1">
+                    <FileAudio className="w-4 h-4" />
+                    <span>Audio only (MP3)</span>
+                  </label>
+                </div>
+              </div>
+
+              {item.status === 'downloading' && (
+                <div className="mt-4">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-gray-600 dark:text-gray-400">Download Progress</span>
+                    <span className="font-medium text-gray-900 dark:text-white">{Math.round(item.progress)}%</span>
+                  </div>
+                  <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2 mt-2">
+                    <div
+                      className="h-2 rounded-full bg-blue-500 transition-all duration-300"
+                      style={{ width: `${item.progress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+
+        <div className="flex space-x-3">
+          <button
+            onClick={addBatchItem}
+            className="flex-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 py-3 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-all duration-300 flex items-center justify-center"
+          >
+            <Plus className="w-5 h-5 mr-2" />
+            Add Video
+          </button>
+          <button
+            onClick={handleBatchDownload}
+            disabled={batchItems.every(item => !item.url || !isValidUrl(item.url)) || batchItems.some(item => item.status === 'downloading')}
+            className="flex-1 bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 disabled:from-gray-400 disabled:to-gray-400 text-white py-3 rounded-lg font-medium transition-all duration-300 transform hover:scale-105 disabled:scale-100"
+          >
+            Start Batch Download
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\DownloadHistory.tsx ===
+import React, { useState } from 'react';
+import { Clock, Download, BarChart3, Play, Trash2, Search, Filter, ExternalLink } from 'lucide-react';
+import { apiService } from '../services/api';
+
+interface Download {
+  id: string;
+  url: string;
+  title: string;
+  quality: string;
+  audioOnly: boolean;
+  status: 'pending' | 'downloading' | 'analyzing' | 'completed' | 'error';
+  progress: number;
+  timestamp: Date;
+  thumbnail?: string;
+  duration?: string;
+  fileSize?: string;
+  analyticsData?: any;
+  downloadUrl?: string;
+}
+
+interface DownloadHistoryProps {
+  downloads: Download[];
+  onViewAnalytics: (download: Download) => void;
+  onRedownload: (url: string, quality: string, audioOnly: boolean) => void;
+}
+
+export const DownloadHistory: React.FC<DownloadHistoryProps> = ({ 
+  downloads, 
+  onViewAnalytics, 
+  onRedownload 
+}) => {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+
+  const filteredDownloads = downloads.filter(download => {
+    const matchesSearch = download.title.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesStatus = statusFilter === 'all' || download.status === statusFilter;
+    return matchesSearch && matchesStatus;
+  });
+
+  const getStatusBadge = (status: string) => {
+    const baseClasses = 'px-2 py-1 rounded-full text-xs font-medium';
+    switch (status) {
+      case 'completed':
+        return `${baseClasses} bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300`;
+      case 'downloading':
+      case 'analyzing':
+        return `${baseClasses} bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-300`;
+      case 'error':
+        return `${baseClasses} bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300`;
+      default:
+        return `${baseClasses} bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-300`;
+    }
+  };
+
+  const handleDelete = (id: string) => {
+    // In a real app, this would delete from the downloads array
+    console.log('Delete download:', id);
+  };
+
+  const handleDownloadFile = async (download: Download) => {
+    try {
+      await apiService.downloadFile(download.id);
+    } catch (error) {
+      console.error('Error downloading file:', error);
+    }
+  };
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-orange-200 dark:border-orange-700">
+      <div className="flex items-center space-x-3 mb-6">
+        <div className="w-10 h-10 bg-gradient-to-r from-orange-500 to-red-600 rounded-lg flex items-center justify-center">
+          <Clock className="w-6 h-6 text-white" />
+        </div>
+        <div>
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Download History</h2>
+          <p className="text-gray-600 dark:text-gray-400">{downloads.length} total downloads</p>
+        </div>
+      </div>
+
+      {/* Search and Filter */}
+      <div className="flex flex-col sm:flex-row gap-4 mb-6">
+        <div className="relative flex-1">
+          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+          <input
+            type="text"
+            placeholder="Search downloads..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+          />
+        </div>
+        <div className="relative">
+          <Filter className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="pl-10 pr-8 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+          >
+            <option value="all">All Status</option>
+            <option value="completed">Completed</option>
+            <option value="downloading">Downloading</option>
+            <option value="analyzing">Analyzing</option>
+            <option value="error">Error</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Downloads List */}
+      <div className="space-y-4">
+        {filteredDownloads.length === 0 ? (
+          <div className="text-center py-12">
+            <Clock className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+            <p className="text-gray-500 dark:text-gray-400">No downloads found</p>
+          </div>
+        ) : (
+          filteredDownloads.map((download) => (
+            <div key={download.id} className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-600 transition-colors">
+              <div className="flex items-start space-x-4">
+                {download.thumbnail && (
+                  <img
+                    src={download.thumbnail}
+                    alt={download.title}
+                    className="w-20 h-12 object-cover rounded"
+                  />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1 min-w-0">
+                      <h3 className="font-medium text-gray-900 dark:text-white truncate">
+                        {download.title}
+                      </h3>
+                      <div className="flex items-center space-x-4 mt-1 text-sm text-gray-500 dark:text-gray-400">
+                        <span>{download.quality}</span>
+                        <span>{download.audioOnly ? 'Audio Only' : 'Video'}</span>
+                        {download.duration && <span>{download.duration}</span>}
+                        {download.fileSize && <span>{download.fileSize}</span>}
+                      </div>
+                      <p className="text-xs text-gray-400 mt-1">
+                        {download.timestamp.toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <span className={getStatusBadge(download.status)}>
+                        {download.status}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex items-center justify-between mt-4">
+                <div className="flex items-center space-x-2">
+                  {download.status === 'completed' && (
+                    <button
+                      onClick={() => handleDownloadFile(download)}
+                      className="flex items-center space-x-1 px-3 py-1 bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300 rounded-lg hover:bg-orange-200 dark:hover:bg-orange-800 transition-colors"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      <span className="text-sm">Download File</span>
+                    </button>
+                  )}
+                  {download.status === 'completed' && download.analyticsData && (
+                    <button
+                      onClick={() => onViewAnalytics(download)}
+                      className="flex items-center space-x-1 px-3 py-1 bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300 rounded-lg hover:bg-purple-200 dark:hover:bg-purple-800 transition-colors"
+                    >
+                      <BarChart3 className="w-4 h-4" />
+                      <span className="text-sm">View Analytics</span>
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onRedownload(download.url, download.quality, download.audioOnly)}
+                    className="flex items-center space-x-1 px-3 py-1 bg-gray-100 dark:bg-gray-900 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span className="text-sm">Redownload</span>
+                  </button>
+                </div>
+                <button
+                  onClick={() => handleDelete(download.id)}
+                  className="p-2 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\DownloadProgress.tsx ===
+import React from 'react';
+import { Download, Loader2, CheckCircle, AlertCircle, BarChart3 } from 'lucide-react';
+
+interface Download {
+  id: string;
+  url: string;
+  title: string;
+  quality: string;
+  audioOnly: boolean;
+  status: 'pending' | 'downloading' | 'analyzing' | 'completed' | 'error';
+  progress: number;
+  timestamp: Date;
+  thumbnail?: string;
+}
+
+interface DownloadProgressProps {
+  downloads: Download[];
+}
+
+export const DownloadProgress: React.FC<DownloadProgressProps> = ({ downloads }) => {
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'downloading':
+        return <Download className="w-4 h-4 text-blue-500 animate-pulse" />;
+      case 'analyzing':
+        return <BarChart3 className="w-4 h-4 text-purple-500 animate-pulse" />;
+      case 'completed':
+        return <CheckCircle className="w-4 h-4 text-green-500" />;
+      case 'error':
+        return <AlertCircle className="w-4 h-4 text-red-500" />;
+      default:
+        return <Loader2 className="w-4 h-4 text-gray-500 animate-spin" />;
+    }
+  };
+
+  const getStatusText = (status: string) => {
+    switch (status) {
+      case 'downloading':
+        return 'Downloading...';
+      case 'analyzing':
+        return 'Analyzing content...';
+      case 'completed':
+        return 'Completed';
+      case 'error':
+        return 'Error';
+      default:
+        return 'Pending...';
+    }
+  };
+
+  const getProgressColor = (status: string) => {
+    switch (status) {
+      case 'downloading':
+        return 'bg-blue-500';
+      case 'analyzing':
+        return 'bg-purple-500';
+      case 'completed':
+        return 'bg-green-500';
+      case 'error':
+        return 'bg-red-500';
+      default:
+        return 'bg-gray-500';
+    }
+  };
+
+  return (
+    <div className="bg-white/80 dark:bg-gray-800/80 backdrop-blur-md rounded-2xl p-6 shadow-xl border border-gray-200 dark:border-gray-700">
+      <div className="flex items-center space-x-3 mb-6">
+        <div className="w-10 h-10 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
+          <Download className="w-6 h-6 text-white" />
+        </div>
+        <div>
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Download Progress</h2>
+          <p className="text-gray-600 dark:text-gray-400">{downloads.length} active downloads</p>
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        {downloads.map((download) => (
+          <div key={download.id} className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+            <div className="flex items-center space-x-3 mb-3">
+              {download.thumbnail && (
+                <img
+                  src={download.thumbnail}
+                  alt={download.title}
+                  className="w-12 h-8 object-cover rounded"
+                />
+              )}
+              <div className="flex-1 min-w-0">
+                <h3 className="font-medium text-gray-900 dark:text-white truncate">
+                  {download.title}
+                </h3>
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  {download.quality} • {download.audioOnly ? 'Audio Only' : 'Video'}
+                </p>
+              </div>
+              <div className="flex items-center space-x-2">
+                {getStatusIcon(download.status)}
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                  {getStatusText(download.status)}
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-600 dark:text-gray-400">Progress</span>
+                <span className="font-medium text-gray-900 dark:text-white">
+                  {Math.round(download.progress)}%
+                </span>
+              </div>
+              <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2">
+                <div
+                  className={`h-2 rounded-full transition-all duration-300 ${getProgressColor(download.status)}`}
+                  style={{ width: `${download.progress}%` }}
+                />
+              </div>
+            </div>
+
+            {download.status === 'analyzing' && (
+              <div className="mt-3 p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg">
+                <div className="flex items-center space-x-2">
+                  <BarChart3 className="w-4 h-4 text-purple-500" />
+                  <span className="text-sm text-purple-700 dark:text-purple-300">
+                    Extracting insights: sentiment analysis, keywords, engagement metrics...
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\ExportModal.tsx ===
+import React from 'react';
+import { X, Download, FileText, Loader2 } from 'lucide-react';
+
+interface ExportModalProps {
+  onClose: () => void;
+}
+
+export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
+  return (
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 w-full max-w-md shadow-2xl">
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Exporting Report</h2>
+          <button
+            onClick={onClose}
+            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+          >
+            <X className="w-5 h-5 text-gray-500" />
+          </button>
+        </div>
+
+        <div className="text-center py-8">
+          <div className="w-16 h-16 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center mx-auto mb-4">
+            <Loader2 className="w-8 h-8 text-white animate-spin" />
+          </div>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
+            Generating Report
+          </h3>
+          <p className="text-gray-600 dark:text-gray-400">
+            Please wait while we compile your analytics data...
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          <div className="flex items-center space-x-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
+            <FileText className="w-5 h-5 text-blue-500" />
+            <span className="text-sm text-gray-700 dark:text-gray-300">Processing video metadata...</span>
+          </div>
+          <div className="flex items-center space-x-3 p-3 bg-gray-50 dark:bg-gray-700 rounded-lg">
+            <Download className="w-5 h-5 text-green-500" />
+            <span className="text-sm text-gray-700 dark:text-gray-300">Compiling analytics data...</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\Header.tsx ===
+import React from 'react';
+import { Download, User, Settings, Moon, Sun, LogOut } from 'lucide-react';
+import { User as UserType } from '../services/api';
+
+interface HeaderProps {
+  user: UserType | null;
+  onLogin: () => void;
+  onLogout: () => void;
+  darkMode: boolean;
+  toggleDarkMode: () => void;
+}
+
+export default function Header({ user, onLogin, onLogout, darkMode, toggleDarkMode }: HeaderProps) {
+  return (
+    <header className="bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-700 sticky top-0 z-50">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex justify-between items-center h-16">
+          <div className="flex items-center space-x-3">
+            <div className="p-2 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg">
+              <Download className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-gray-900 dark:text-white">
+                YouTube Video Downloader
+              </h1>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Download your YouTube videos in high quality
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-4">
+            <button
+              onClick={toggleDarkMode}
+              className="p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
+            >
+              {darkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+            </button>
+
+            {user ? (
+              <div className="flex items-center space-x-3">
+                <div className="flex items-center space-x-2">
+                  <div className="w-8 h-8 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center">
+                    <User className="w-4 h-4 text-white" />
+                  </div>
+                  <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {user.name}
+                  </span>
+                </div>
+                <button
+                  onClick={onLogout}
+                  className="p-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={onLogin}
+                className="bg-gradient-to-r from-blue-500 to-purple-600 text-white px-4 py-2 rounded-lg hover:from-blue-600 hover:to-purple-700 transition-all duration-200 font-medium"
+              >
+                Sign In
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\Settings.tsx ===
+import React, { useState } from 'react';
+import { Settings as SettingsIcon, Moon, Sun, Download, Bell, Shield, User } from 'lucide-react';
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar?: string;
+}
+
+interface SettingsProps {
+  darkMode: boolean;
+  toggleDarkMode: () => void;
+  user: User | null;
+}
+
+export const Settings: React.FC<SettingsProps> = ({ darkMode, toggleDarkMode, user }) => {
+  const [notifications, setNotifications] = useState(true);
+  const [autoDownload, setAutoDownload] = useState(false);
+  const [defaultQuality, setDefaultQuality] = useState('720p');
+  const [maxConcurrentDownloads, setMaxConcurrentDownloads] = useState(3);
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-gray-200 dark:border-gray-700">
+      <div className="flex items-center space-x-3 mb-6">
+        <div className="w-10 h-10 bg-gradient-to-r from-gray-500 to-gray-600 rounded-lg flex items-center justify-center">
+          <SettingsIcon className="w-6 h-6 text-white" />
+        </div>
+        <div>
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Settings</h2>
+          <p className="text-gray-600 dark:text-gray-400">Customize your experience</p>
+        </div>
+      </div>
+
+      <div className="space-y-6">
+        {/* Appearance */}
+        <div className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <h3 className="font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            {darkMode ? <Moon className="w-5 h-5" /> : <Sun className="w-5 h-5" />}
+            <span>Appearance</span>
+          </h3>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-gray-700 dark:text-gray-300">Dark Mode</span>
+              <button
+                onClick={toggleDarkMode}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  darkMode ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    darkMode ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Download Settings */}
+        <div className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <h3 className="font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <Download className="w-5 h-5" />
+            <span>Download Settings</span>
+          </h3>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                Default Quality
+              </label>
+              <select
+                value={defaultQuality}
+                onChange={(e) => setDefaultQuality(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                <option value="360p">360p</option>
+                <option value="720p">720p (HD)</option>
+                <option value="1080p">1080p (Full HD)</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                Max Concurrent Downloads
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                value={maxConcurrentDownloads}
+                onChange={(e) => setMaxConcurrentDownloads(parseInt(e.target.value))}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Auto-download</span>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Start downloading immediately after URL input</p>
+              </div>
+              <button
+                onClick={() => setAutoDownload(!autoDownload)}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  autoDownload ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    autoDownload ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Notifications */}
+        <div className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <h3 className="font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <Bell className="w-5 h-5" />
+            <span>Notifications</span>
+          </h3>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Download Complete</span>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Get notified when downloads finish</p>
+              </div>
+              <button
+                onClick={() => setNotifications(!notifications)}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  notifications ? 'bg-blue-600' : 'bg-gray-200'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    notifications ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Account */}
+        {user && (
+          <div className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+              <User className="w-5 h-5" />
+              <span>Account</span>
+            </h3>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="text-sm font-medium text-gray-700 dark:text-gray-300">{user.name}</span>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">{user.email}</p>
+                </div>
+                <button className="text-blue-600 hover:text-blue-700 text-sm font-medium">
+                  Edit Profile
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Privacy */}
+        <div className="p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <h3 className="font-semibold text-gray-900 dark:text-white mb-4 flex items-center space-x-2">
+            <Shield className="w-5 h-5" />
+            <span>Privacy & Security</span>
+          </h3>
+          <div className="space-y-3">
+            <button className="text-left w-full text-sm text-gray-700 dark:text-gray-300 hover:text-blue-600 transition-colors">
+              Clear Download History
+            </button>
+            <button className="text-left w-full text-sm text-gray-700 dark:text-gray-300 hover:text-blue-600 transition-colors">
+              Export Data
+            </button>
+            <button className="text-left w-full text-sm text-red-600 hover:text-red-700 transition-colors">
+              Delete Account
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\UserDashboard.tsx ===
+import React from 'react';
+import { User, TrendingUp, Download, BarChart3, Calendar, Award } from 'lucide-react';
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar?: string;
+}
+
+interface Download {
+  id: string;
+  status: 'pending' | 'downloading' | 'analyzing' | 'completed' | 'error';
+  timestamp: Date;
+  quality: string;
+  audioOnly: boolean;
+}
+
+interface UserDashboardProps {
+  user: User;
+  downloads: Download[];
+}
+
+export const UserDashboard: React.FC<UserDashboardProps> = ({ user, downloads }) => {
+  const completedDownloads = downloads.filter(d => d.status === 'completed');
+  const thisWeekDownloads = downloads.filter(d => {
+    const weekAgo = new Date();
+    weekAgo.setDate(weekAgo.getDate() - 7);
+    return d.timestamp >= weekAgo;
+  });
+
+  const qualityStats = downloads.reduce((acc, download) => {
+    acc[download.quality] = (acc[download.quality] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  const audioOnlyCount = downloads.filter(d => d.audioOnly).length;
+  const videoCount = downloads.length - audioOnlyCount;
+
+  const achievements = [
+    { 
+      title: 'First Download', 
+      description: 'Downloaded your first video',
+      icon: '🎉',
+      unlocked: downloads.length > 0
+    },
+    { 
+      title: 'Power User', 
+      description: 'Downloaded 10+ videos',
+      icon: '💪',
+      unlocked: downloads.length >= 10
+    },
+    { 
+      title: 'Quality Enthusiast', 
+      description: 'Downloaded in 1080p',
+      icon: '🎬',
+      unlocked: downloads.some(d => d.quality === '1080p')
+    },
+    { 
+      title: 'Audio Collector', 
+      description: 'Downloaded 5+ audio files',
+      icon: '🎵',
+      unlocked: audioOnlyCount >= 5
+    }
+  ];
+
+  return (
+    <div className="space-y-6">
+      {/* User Profile */}
+      <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-gray-200 dark:border-gray-700">
+        <div className="flex items-center space-x-4 mb-6">
+          <div className="w-16 h-16 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center">
+            <User className="w-8 h-8 text-white" />
+          </div>
+          <div>
+            <h2 className="text-2xl font-bold text-gray-900 dark:text-white">{user.name}</h2>
+            <p className="text-gray-600 dark:text-gray-400">{user.email}</p>
+          </div>
+        </div>
+
+        {/* Stats Grid */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="bg-gradient-to-r from-blue-500 to-blue-600 rounded-lg p-4 text-white">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-blue-100 text-sm">Total Downloads</p>
+                <p className="text-2xl font-bold">{downloads.length}</p>
+              </div>
+              <Download className="w-8 h-8 text-blue-200" />
+            </div>
+          </div>
+          <div className="bg-gradient-to-r from-green-500 to-green-600 rounded-lg p-4 text-white">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-green-100 text-sm">Completed</p>
+                <p className="text-2xl font-bold">{completedDownloads.length}</p>
+              </div>
+              <TrendingUp className="w-8 h-8 text-green-200" />
+            </div>
+          </div>
+          <div className="bg-gradient-to-r from-purple-500 to-purple-600 rounded-lg p-4 text-white">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-purple-100 text-sm">This Week</p>
+                <p className="text-2xl font-bold">{thisWeekDownloads.length}</p>
+              </div>
+              <Calendar className="w-8 h-8 text-purple-200" />
+            </div>
+          </div>
+          <div className="bg-gradient-to-r from-orange-500 to-orange-600 rounded-lg p-4 text-white">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-orange-100 text-sm">Success Rate</p>
+                <p className="text-2xl font-bold">
+                  {downloads.length > 0 ? Math.round((completedDownloads.length / downloads.length) * 100) : 0}%
+                </p>
+              </div>
+              <BarChart3 className="w-8 h-8 text-orange-200" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Download Preferences */}
+      <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-gray-200 dark:border-gray-700">
+        <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Download Preferences</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div>
+            <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-3">Quality Distribution</h4>
+            <div className="space-y-2">
+              {Object.entries(qualityStats).map(([quality, count]) => (
+                <div key={quality} className="flex items-center justify-between">
+                  <span className="text-sm text-gray-600 dark:text-gray-400">{quality}</span>
+                  <div className="flex items-center space-x-2">
+                    <div className="w-20 bg-gray-200 dark:bg-gray-600 rounded-full h-2">
+                      <div
+                        className="bg-blue-500 h-2 rounded-full"
+                        style={{ width: `${(count / downloads.length) * 100}%` }}
+                      />
+                    </div>
+                    <span className="text-sm font-medium text-gray-900 dark:text-white">{count}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-3">Content Type</h4>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-gray-600 dark:text-gray-400">Video</span>
+                <span className="text-sm font-medium text-gray-900 dark:text-white">{videoCount}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-gray-600 dark:text-gray-400">Audio Only</span>
+                <span className="text-sm font-medium text-gray-900 dark:text-white">{audioOnlyCount}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Achievements */}
+      <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-gray-200 dark:border-gray-700">
+        <div className="flex items-center space-x-3 mb-4">
+          <Award className="w-6 h-6 text-yellow-500" />
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Achievements</h3>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {achievements.map((achievement, index) => (
+            <div key={index} className={`p-4 rounded-lg border-2 ${
+              achievement.unlocked 
+                ? 'bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-800' 
+                : 'bg-gray-50 dark:bg-gray-700 border-gray-200 dark:border-gray-600'
+            }`}>
+              <div className="flex items-center space-x-3">
+                <span className="text-2xl">{achievement.icon}</span>
+                <div>
+                  <h4 className={`font-medium ${
+                    achievement.unlocked 
+                      ? 'text-yellow-800 dark:text-yellow-200' 
+                      : 'text-gray-600 dark:text-gray-400'
+                  }`}>
+                    {achievement.title}
+                  </h4>
+                  <p className={`text-sm ${
+                    achievement.unlocked 
+                      ? 'text-yellow-600 dark:text-yellow-300' 
+                      : 'text-gray-500 dark:text-gray-500'
+                  }`}>
+                    {achievement.description}
+                  </p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\components\VideoDownloader.tsx ===
+import React, { useState, useEffect } from 'react';
+import { Download, Clock, Eye, Heart, MessageCircle, FileAudio } from 'lucide-react';
+import { apiService, VideoInfo } from '../services/api';
+
+interface VideoDownloaderProps {
+  onDownload: (url: string, quality: string, audioOnly: boolean) => void;
+  downloadError: string | null;
+  clearDownloadError: () => void;
+  onDownloadComplete: () => void;
+}
+
+export const VideoDownloader: React.FC<VideoDownloaderProps> = ({ onDownload, downloadError, clearDownloadError, onDownloadComplete }) => {
+  const [url, setUrl] = useState('');
+  const [quality, setQuality] = useState('720p');
+  const [audioOnly, setAudioOnly] = useState(false);
+  const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadId, setDownloadId] = useState<string | null>(null);
+
+  const isValidUrl = (url: string) => {
+    return (
+      url.includes('youtube.com') ||
+      url.includes('youtu.be')
+    );
+  };
+
+  useEffect(() => {
+    if (!url || !isValidUrl(url)) {
+      setVideoInfo(null);
+      setAnalyzeError(null);
+      return;
+    }
+
+    const analyze = async () => {
+      setAnalyzeError(null);
+      clearDownloadError();
+      setIsAnalyzing(true);
+      setVideoInfo(null);
+
+      try {
+        const info = await apiService.getVideoInfo(url);
+        setVideoInfo(info);
+        if (info.availableQualities && info.availableQualities.length > 0) {
+          setQuality(info.availableQualities[info.availableQualities.length - 1]);
+        }
+      } catch (err) {
+        setAnalyzeError(err instanceof Error ? err.message : 'Failed to analyze video');
+      } finally {
+        setIsAnalyzing(false);
+      }
+    };
+
+    const timeout = setTimeout(analyze, 500);
+    return () => clearTimeout(timeout);
+  }, [url, clearDownloadError]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout | null = null;
+    if (downloadId && isDownloading) {
+      interval = setInterval(async () => {
+        try {
+          const status = await apiService.getDownloadStatus(downloadId);
+          setDownloadProgress(status.progress);
+          if (status.status === 'completed') {
+            setIsDownloading(false);
+            setDownloadId(null);
+            onDownloadComplete();
+          } else if (status.status === 'error') {
+            setIsDownloading(false);
+            setDownloadId(null);
+            setAnalyzeError(status.errorMessage ?? 'Download failed');
+          }
+        } catch (err) {
+          setIsDownloading(false);
+          setDownloadId(null);
+          setAnalyzeError(err instanceof Error ? err.message : 'Failed to check download status');
+        }
+      }, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [downloadId, isDownloading, onDownloadComplete]);
+
+  const handleDownload = async () => {
+    if (url && isValidUrl(url)) {
+      setAnalyzeError(null);
+      clearDownloadError();
+      setIsDownloading(true);
+      setDownloadProgress(0);
+      try {
+        const downloadResponse = await apiService.downloadVideo({ url, quality, audioOnly });
+        setDownloadId(downloadResponse.downloadId);
+        await onDownload(url, quality, audioOnly);
+      } catch (err) {
+        setIsDownloading(false);
+        setDownloadId(null);
+        setAnalyzeError(err instanceof Error ? err.message : 'Failed to start download');
+      }
+    }
+  };
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-xl border border-orange-200 dark:border-orange-700">
+      <div className="flex items-center space-x-3 mb-6">
+        <div className="w-10 h-10 bg-gradient-to-r from-orange-500 to-red-600 rounded-lg flex items-center justify-center">
+          <Download className="w-6 h-6 text-white" />
+        </div>
+        <div>
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white">Video Downloader</h2>
+          <p className="text-gray-600 dark:text-gray-400">YouTube</p>
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+            Video URL
+          </label>
+          <input
+            type="url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="Paste YouTube video URL here..."
+            className="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent transition-all"
+            disabled={isDownloading}
+          />
+        </div>
+
+        <div className="flex flex-col sm:flex-row gap-4">
+          <div className="flex-1">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Quality
+            </label>
+            <select
+              value={quality}
+              onChange={(e) => setQuality(e.target.value)}
+              disabled={isAnalyzing || isDownloading}
+              className="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+            >
+              {videoInfo?.availableQualities ? (
+                videoInfo.availableQualities.map(qual => (
+                  <option key={qual} value={qual}>
+                    {qual} {qual === '720p' ? '(HD)' : qual === '1080p' ? '(Full HD)' : qual === '1440p' ? '(2K)' : qual === '2160p' ? '(4K)' : ''}
+                  </option>
+                ))
+              ) : (
+                <>
+                  <option value="360p">360p</option>
+                  <option value="720p">720p (HD)</option>
+                  <option value="1080p">1080p (Full HD)</option>
+                </>
+              )}
+            </select>
+          </div>
+
+          <div className="flex items-center space-x-2 pt-8">
+            <input
+              type="checkbox"
+              id="audioOnly"
+              checked={audioOnly}
+              onChange={(e) => setAudioOnly(e.target.checked)}
+              disabled={isDownloading}
+              className="w-5 h-5 text-orange-600 rounded focus:ring-orange-500"
+            />
+            <label htmlFor="audioOnly" className="text-sm text-gray-700 dark:text-gray-300 flex items-center space-x-1">
+              <FileAudio className="w-4 h-4" />
+              <span>Audio only (MP3)</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="flex space-x-3">
+          <button
+            onClick={handleDownload}
+            disabled={!url || isAnalyzing || isDownloading || !isValidUrl(url)}
+            className="flex-1 bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 disabled:from-gray-400 disabled:to-gray-400 text-white py-3 rounded-lg font-medium transition-all duration-300 transform hover:scale-105 disabled:scale-100"
+          >
+            {isDownloading ? 'Downloading...' : 'Download'}
+          </button>
+        </div>
+      </div>
+
+      {(analyzeError || downloadError) && (
+        <div className="mt-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+          <p className="text-red-700 dark:text-red-300 text-sm">{analyzeError || downloadError}</p>
+        </div>
+      )}
+
+      {isAnalyzing && (
+        <div className="mt-4 p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <p className="text-sm text-gray-600 dark:text-gray-400">Analyzing video...</p>
+        </div>
+      )}
+
+      {isDownloading && (
+        <div className="mt-4 p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-gray-600 dark:text-gray-400">Download Progress</span>
+            <span className="font-medium text-gray-900 dark:text-white">{Math.round(downloadProgress)}%</span>
+          </div>
+          <div className="w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2 mt-2">
+            <div
+              className="h-2 rounded-full bg-blue-500 transition-all duration-300"
+              style={{ width: `${downloadProgress}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {videoInfo && !isAnalyzing && (
+        <div className="mt-6 p-4 bg-gray-50 dark:bg-gray-700 rounded-lg">
+          <div className="flex space-x-4">
+            <img
+              src={videoInfo.thumbnail}
+              alt={videoInfo.title}
+              className="w-24 h-16 object-cover rounded"
+              onError={(e) => {
+                (e.target as HTMLImageElement).src = 'https://images.pexels.com/photos/1181671/pexels-photo-1181671.jpeg?auto=compress&cs=tinysrgb&w=800';
+              }}
+            />
+            <div className="flex-1">
+              <h3 className="font-semibold text-gray-900 dark:text-white mb-1">{videoInfo.title}</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{videoInfo.author}</p>
+              <div className="flex items-center space-x-4 text-xs text-gray-500 dark:text-gray-400">
+                <div className="flex items-center space-x-1">
+                  <Clock className="w-3 h-3" />
+                  <span>{videoInfo.duration}</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <Eye className="w-3 h-3" />
+                  <span>{videoInfo.views}</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <Heart className="w-3 h-3" />
+                  <span>{videoInfo.likes}</span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <MessageCircle className="w-3 h-3" />
+                  <span>{videoInfo.comments}</span>
+                </div>
+              </div>
+              {videoInfo.availableQualities && (
+                <div className="mt-2">
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Available qualities: {videoInfo.availableQualities.join(', ')}
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\services ===
+[Error reading file]: [Errno 13] Permission denied: 'C:\\Users\\Dell\\Downloads\\yt-downloader-sucess\\project\\src\\services'
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\App.tsx ===
+import { useState, useEffect } from 'react';
+import { apiService } from './services/api';
+import Header from './components/Header';
+import { VideoDownloader } from './components/VideoDownloader';
+import { BatchDownloader } from './components/BatchDownloader';
+import { AnalyticsDashboard } from './components/AnalyticsDashboard';
+import { DownloadProgress } from './components/DownloadProgress';
+import { DownloadHistory } from './components/DownloadHistory';
+import { UserDashboard } from './components/UserDashboard';
+import { AuthModal } from './components/AuthModal';
+import { ExportModal } from './components/ExportModal';
+import { Settings } from './components/Settings';
+import { User } from './services/api';
+
+interface Download {
+  id: string;
+  url: string;
+  title: string;
+  quality: string;
+  audioOnly: boolean;
+  status: 'pending' | 'downloading' | 'analyzing' | 'completed' | 'error';
+  progress: number;
+  timestamp: Date;
+  thumbnail?: string;
+  duration?: string;
+  fileSize?: string;
+  analyticsData?: any;
+  downloadUrl?: string;
+}
+
+interface BatchItem {
+  id: string;
+  url: string;
+  quality: string;
+  audioOnly: boolean;
+  status: 'pending' | 'downloading' | 'completed' | 'error';
+  progress: number;
+}
+
+function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [darkMode, setDarkMode] = useState(false);
+  const [activeTab, setActiveTab] = useState<'download' | 'batch' | 'analytics' | 'history' | 'dashboard' | 'settings'>('download');
+  const [downloads, setDownloads] = useState<Download[]>([]);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [selectedAnalytics, setSelectedAnalytics] = useState<any>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [activeDownloadIds, setActiveDownloadIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    const savedDarkMode = localStorage.getItem('darkMode');
+    if (savedDarkMode) {
+      setDarkMode(JSON.parse(savedDarkMode));
+    }
+
+    const savedUser = localStorage.getItem('user');
+    if (savedUser) {
+      setUser(JSON.parse(savedUser));
+    }
+
+    loadDownloads();
+  }, []);
+
+  useEffect(() => {
+    if (activeDownloadIds.size > 0) {
+      const interval = setInterval(async () => {
+        for (const downloadId of activeDownloadIds) {
+          try {
+            const updatedDownload = await apiService.getDownloadStatus(downloadId);
+            setDownloads(prev => prev.map(d => 
+              d.id === downloadId ? {
+                ...updatedDownload,
+                timestamp: new Date(updatedDownload.timestamp)
+              } : d
+            ));
+
+            if (updatedDownload.status === 'completed' || updatedDownload.status === 'error') {
+              setActiveDownloadIds(prev => {
+                const newSet = new Set(prev);
+                newSet.delete(downloadId);
+                return newSet;
+              });
+            }
+          } catch (error) {
+            console.error('Error polling download status:', error);
+          }
+        }
+      }, 1000);
+
+      return () => clearInterval(interval);
+    }
+  }, [activeDownloadIds]);
+
+  const loadDownloads = async () => {
+    try {
+      const allDownloads = await apiService.getAllDownloads();
+      setFetchError(null);
+      setDownloads(allDownloads.map(d => ({
+        ...d,
+        timestamp: new Date(d.timestamp)
+      })));
+    } catch (error) {
+      console.error('Error loading downloads:', error);
+      setFetchError(`Failed to load downloads: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  useEffect(() => {
+    if (darkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem('darkMode', JSON.stringify(darkMode));
+  }, [darkMode]);
+
+  const handleLogin = () => {
+    setShowAuthModal(true);
+  };
+
+  const handleAuthSuccess = (userData: User) => {
+    setUser(userData);
+    localStorage.setItem('user', JSON.stringify(userData));
+    setShowAuthModal(false);
+  };
+
+  const handleLogout = () => {
+    setUser(null);
+    localStorage.removeItem('user');
+  };
+
+  const handleDownload = async (url: string, quality: string, audioOnly: boolean) => {
+    try {
+      setFetchError(null);
+      const downloadResponse = await apiService.downloadVideo({ url, quality, audioOnly });
+      setFetchError(null);
+      
+      const newDownload: Download = {
+        ...downloadResponse,
+        timestamp: new Date(downloadResponse.timestamp)
+      };
+
+      setDownloads(prev => [newDownload, ...prev]);
+      setActiveDownloadIds(prev => new Set(prev).add(downloadResponse.downloadId));
+    } catch (error) {
+      console.error('Error starting download:', error);
+      setFetchError(`Failed to start download: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const clearFetchError = () => {
+    setFetchError(null);
+  };
+
+  const handleBatchDownload = (items: BatchItem[]) => {
+    items.forEach((item, index) => {
+      setTimeout(() => {
+        handleDownload(item.url, item.quality, item.audioOnly);
+      }, index * 1000);
+    });
+  };
+
+  const handleExport = (format: 'csv' | 'pdf') => {
+    setShowExportModal(true);
+    
+    setTimeout(async () => {
+      try {
+        if (selectedAnalytics && downloads.length > 0) {
+          const downloadWithAnalytics = downloads.find(d => d.analyticsData === selectedAnalytics);
+          if (downloadWithAnalytics) {
+            await apiService.exportAnalytics(downloadWithAnalytics.id, format);
+          }
+        }
+      } catch (error) {
+        console.error('Export error:', error);
+      }
+      setShowExportModal(false);
+    }, 2000);
+  };
+
+  const handleViewAnalytics = (download: Download) => {
+    if (download.analyticsData) {
+      setSelectedAnalytics(download.analyticsData);
+      setActiveTab('analytics');
+    }
+  };
+
+  const toggleDarkMode = () => {
+    setDarkMode(!darkMode);
+  };
+
+  const handleDownloadComplete = () => {
+    setActiveTab('history');
+  };
+
+  const activeDownloads = downloads.filter(d => d.status === 'downloading' || d.status === 'analyzing');
+
+  return (
+    <div className={`min-h-screen transition-colors duration-300 ${darkMode ? 'dark' : ''}`}>
+      <div className="min-h-screen bg-gradient-to-br from-orange-50 via-white to-red-50 dark:from-gray-900 dark:via-gray-800 dark:to-orange-900">
+        <Header
+          user={user}
+          onLogin={handleLogin}
+          onLogout={handleLogout}
+          darkMode={darkMode}
+          toggleDarkMode={toggleDarkMode}
+        />
+
+        <main className="container mx-auto px-4 py-8">
+          {fetchError && (
+            <div className="mb-6 p-4 bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700 rounded-lg">
+              <div className="flex items-center">
+                <span className="text-red-600 dark:text-red-400 mr-2">⚠️</span>
+                <p className="text-red-800 dark:text-red-200 font-medium">Connection Error</p>
+              </div>
+              <p className="text-red-700 dark:text-red-300 mt-1 text-sm">{fetchError}</p>
+              <button
+                onClick={() => setFetchError(null)}
+                className="mt-2 text-xs text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-200 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-2 mb-8">
+            {[
+              { id: 'download', label: 'Download', icon: '📥' },
+              { id: 'batch', label: 'Batch', icon: '📋' },
+              { id: 'analytics', label: 'Analytics', icon: '📊' },
+              { id: 'history', label: 'History', icon: '🕒' },
+              ...(user ? [{ id: 'dashboard', label: 'Dashboard', icon: '📱' }] : []),
+              { id: 'settings', label: 'Settings', icon: '⚙️' }
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id as any)}
+                className={`px-4 py-2 rounded-lg font-medium transition-all duration-300 transform hover:scale-105 ${
+                  activeTab === tab.id
+                    ? 'bg-gradient-to-r from-orange-500 to-red-600 text-white shadow-lg'
+                    : 'bg-white/70 dark:bg-gray-800/70 text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-700'
+                }`}
+              >
+                <span className="mr-2">{tab.icon}</span>
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {activeDownloads.length > 0 && (
+            <div className="mb-8">
+              <DownloadProgress downloads={activeDownloads} />
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            <div className="lg:col-span-8">
+              {activeTab === 'download' && (
+                <VideoDownloader 
+                  onDownload={handleDownload}
+                  downloadError={fetchError}
+                  clearDownloadError={clearFetchError}
+                  onDownloadComplete={handleDownloadComplete}
+                />
+              )}
+              
+              {activeTab === 'batch' && (
+                <BatchDownloader 
+                  onBatchDownload={handleBatchDownload} 
+                  onDownloadComplete={handleDownloadComplete}
+                />
+              )}
+              
+              {activeTab === 'analytics' && selectedAnalytics && (
+                <AnalyticsDashboard data={selectedAnalytics} onExport={handleExport} />
+              )}
+              
+              {activeTab === 'history' && (
+                <DownloadHistory 
+                  downloads={downloads}
+                  onViewAnalytics={handleViewAnalytics}
+                  onRedownload={handleDownload}
+                />
+              )}
+              
+              {activeTab === 'dashboard' && user && (
+                <UserDashboard user={user} downloads={downloads} />
+              )}
+              
+              {activeTab === 'settings' && (
+                <Settings 
+                  darkMode={darkMode}
+                  toggleDarkMode={toggleDarkMode}
+                  user={user}
+                />
+              )}
+            </div>
+
+            <div className="lg:col-span-4">
+              <div className="sticky top-24 space-y-6">
+                <div className="bg-white/80 dark:bg-gray-800/80 backdrop-blur-md rounded-2xl p-6 shadow-xl border border-orange-200 dark:border-orange-700">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Quick Stats</h3>
+                  <div className="space-y-3">
+                    <div className="flex justify-between">
+                      <span className="text-gray-600 dark:text-gray-400">Total Downloads</span>
+                      <span className="font-medium text-gray-900 dark:text-white">{downloads.length}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600 dark:text-gray-400">Completed</span>
+                      <span className="font-medium text-green-600">{downloads.filter(d => d.status === 'completed').length}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-600 dark:text-gray-400">In Progress</span>
+                      <span className="font-medium text-orange-600">{activeDownloads.length}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white/80 dark:bg-gray-800/80 backdrop-blur-md rounded-2xl p-6 shadow-xl border border-orange-200 dark:border-orange-700">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Recent Activity</h3>
+                  <div className="space-y-3">
+                    {downloads.slice(0, 3).map(download => (
+                      <div key={download.id} className="flex items-center space-x-3 p-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                        <div className={`w-2 h-2 rounded-full ${
+                          download.status === 'completed' ? 'bg-green-500' :
+                          download.status === 'downloading' || download.status === 'analyzing' ? 'bg-orange-500' :
+                          'bg-gray-500'
+                        }`} />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                            {download.title}
+                          </p>
+                          <p className="text-xs text-gray-500 dark:text-gray-400">
+                            {download.timestamp.toLocaleTimeString()}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        {showAuthModal && (
+          <AuthModal
+            onSuccess={handleAuthSuccess}
+            onClose={() => setShowAuthModal(false)}
+          />
+        )}
+        
+        {showExportModal && (
+          <ExportModal onClose={() => setShowExportModal(false)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\index.css ===
+/* Suppress VS Code warnings for Tailwind directives */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-100 dark:bg-gray-900 text-gray-800 dark:text-gray-200;
+    font-family: 'Arial', sans-serif;
+  }
+
+  button {
+    @apply transition duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50;
+  }
+
+  input, select {
+    @apply border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500 focus:border-transparent;
+  }
+
+  .card {
+    @apply bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-600 p-4;
+  }
+
+  .btn-primary {
+    @apply bg-blue-500 text-white font-medium py-2 px-4 rounded-md hover:bg-blue-600 disabled:bg-gray-400 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-500 text-white font-medium py-2 px-4 rounded-md hover:bg-gray-600 disabled:bg-gray-400 disabled:cursor-not-allowed;
+  }
+
+  .progress-bar {
+    @apply bg-gray-200 dark:bg-gray-700 rounded-full h-2;
+  }
+
+  .progress-bar-fill {
+    @apply bg-blue-500 rounded-full h-2 transition-all duration-300;
+  }
+}
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\main.tsx ===
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>
+);
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\src\vite-env.d.ts ===
+/// <reference types="vite/client" />
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\.env ===
+VITE_API_URL=http://localhost:3001
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\apiService.ts ===
+export interface VideoInfo {
+  title: string;
+  thumbnail: string;
+  duration: string;
+  views: string;
+  likes: string;
+  comments: string;
+  author: string;
+  availableQualities: string[];
+}
+
+export interface DownloadRequest {
+  url: string;
+  quality: string;
+  audioOnly: boolean;
+}
+
+export interface DownloadStatus {
+  id: string;
+  url: string;
+  quality: string;
+  audioOnly: boolean;
+  status: 'pending' | 'downloading' | 'analyzing' | 'completed' | 'error';
+  progress: number;
+  timestamp: string;
+  title?: string;
+  thumbnail?: string;
+  duration?: string;
+  fileSize?: string;
+  downloadUrl?: string;
+  errorMessage?: string;
+}
+
+export const apiService = {
+  getVideoInfo: async (url: string): Promise<VideoInfo> => {
+    try {
+      const response = await fetch('http://localhost:3001/api/video-info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        console.error('getVideoInfo error response:', text);
+        throw new Error(`Failed to fetch video info: ${response.status} ${response.statusText}`);
+      }
+      const data = await response.json();
+      return data;
+    } catch (err) {
+      console.error('getVideoInfo error:', err);
+      throw err instanceof Error ? err : new Error('Failed to fetch video info');
+    }
+  },
+
+  downloadVideo: async (request: DownloadRequest): Promise<{ downloadId: string }> => {
+    try {
+      const response = await fetch('http://localhost:3001/api/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        console.error('downloadVideo error response:', text);
+        throw new Error(`Failed to start download: ${response.status} ${response.statusText}`);
+      }
+      const data = await response.json();
+      return data;
+    } catch (err) {
+      console.error('downloadVideo error:', err);
+      throw err instanceof Error ? err : new Error('Failed to start download');
+    }
+  },
+
+  getDownloadStatus: async (downloadId: string): Promise<DownloadStatus> => {
+    try {
+      const response = await fetch(`http://localhost:3001/api/download-status/${downloadId}`);
+      if (!response.ok) {
+        const text = await response.text();
+        console.error('getDownloadStatus error response:', text);
+        throw new Error(`Failed to get download status: ${response.status} ${response.statusText}`);
+      }
+      const data = await response.json();
+      return data;
+    } catch (err) {
+      console.error('getDownloadStatus error:', err);
+      throw err instanceof Error ? err : new Error('Failed to check download status');
+    }
+  },
+
+  getAllDownloads: async (): Promise<DownloadStatus[]> => {
+    try {
+      const response = await fetch('http://localhost:3001/api/downloads');
+      if (!response.ok) {
+        const text = await response.text();
+        console.error('getAllDownloads error response:', text);
+        throw new Error(`Failed to get downloads: ${response.status} ${response.statusText}`);
+      }
+      const data = await response.json();
+      return data;
+    } catch (err) {
+      console.error('getAllDownloads error:', err);
+      throw err instanceof Error ? err : new Error('Failed to get downloads');
+    }
+  },
+};
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\eslint.config.js ===
+import js from '@eslint/js';
+import globals from 'globals';
+import reactHooks from 'eslint-plugin-react-hooks';
+import reactRefresh from 'eslint-plugin-react-refresh';
+import tseslint from 'typescript-eslint';
+
+export default tseslint.config(
+  { ignores: ['dist'] },
+  {
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    files: ['**/*.{ts,tsx}'],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.browser,
+    },
+    plugins: {
+      'react-hooks': reactHooks,
+      'react-refresh': reactRefresh,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      'react-refresh/only-export-components': [
+        'warn',
+        { allowConstantExport: true },
+      ],
+      'no-unused-vars': 'off', // Disable default unused vars rule
+      '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_' }], // Use TypeScript-specific rule
+    },
+  }
+);
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\index.html ===
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YouTube Video Downloader and Analyzer</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\package.json ===
+{
+  "name": "vite-react-typescript-starter",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "server": "node server/index.js",
+    "dev:full": "concurrently \"npm run server\" \"npm run dev\"",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.10.0",
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "lucide-react": "^0.344.0",
+    "multer": "^2.0.1",
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^24.12.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2",
+    "uuid": "^11.1.0",
+    "yt-dlp-wrap": "^2.3.12"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.1",
+    "@types/bcrypt": "^5.0.2",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/fluent-ffmpeg": "^2.1.27",
+    "@types/multer": "^2.0.0",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.18",
+    "concurrently": "^9.2.0",
+    "eslint": "^9.9.1",
+    "eslint-plugin-react-hooks": "^5.1.0-rc.0",
+    "eslint-plugin-react-refresh": "^0.4.11",
+    "globals": "^15.9.0",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.5.3",
+    "typescript-eslint": "^8.3.0",
+    "vite": "^5.4.2"
+  }
+}
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\postcss.config.js ===
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\README.md ===
+# YouTube & Instagram Video Downloader and Analyzer
+
+A comprehensive web application for downloading and analyzing videos from YouTube and Instagram with AI-powered insights.
+
+## Features
+
+- **Multi-platform Support**: Download videos from YouTube and Instagram
+- **Quality Selection**: Choose from 360p, 720p, or 1080p
+- **Audio-only Downloads**: Extract MP3 audio from videos
+- **Real-time Analysis**: AI-powered sentiment analysis, keyword extraction, and engagement metrics
+- **Batch Processing**: Download multiple videos simultaneously
+- **User Dashboard**: Track download history and analytics
+- **Export Functionality**: Export analytics to CSV format
+- **Dark Mode**: Beautiful dark/light theme support
+- **Responsive Design**: Works on desktop, tablet, and mobile
+
+## Prerequisites
+
+Before running this application, make sure you have:
+
+1. **Node.js** (v16 or higher)
+2. **Python** (v3.7 or higher)
+3. **yt-dlp** - Install with: `pip install yt-dlp`
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd video-downloader-app
+```
+
+2. Install dependencies:
+```bash
+npm install
+```
+
+3. Install yt-dlp (required for video downloading):
+```bash
+pip install yt-dlp
+```
+
+## Running the Application
+
+### Development Mode
+
+To run both frontend and backend simultaneously:
+```bash
+npm run dev:full
+```
+
+Or run them separately:
+
+**Backend only:**
+```bash
+npm run server
+```
+
+**Frontend only:**
+```bash
+npm run dev
+```
+
+The application will be available at:
+- Frontend: http://localhost:5173
+- Backend API: http://localhost:3001
+
+## API Endpoints
+
+- `POST /api/video-info` - Get video metadata
+- `POST /api/download` - Start video download
+- `GET /api/download/:id` - Get download status
+- `GET /api/downloads` - Get all downloads
+- `POST /api/export` - Export analytics data
+
+## Usage
+
+1. **Analyze Video**: Paste a YouTube or Instagram URL and click "Analyze Video" to see metadata
+2. **Download**: Select quality and format, then click "Download"
+3. **Track Progress**: Monitor downloads in real-time with progress indicators
+4. **View Analytics**: Once complete, view AI-generated insights including sentiment analysis and keywords
+5. **Export Data**: Export analytics to CSV format
+
+## Technical Stack
+
+### Frontend
+- React 18 with TypeScript
+- Tailwind CSS for styling
+- Lucide React for icons
+- Vite for build tooling
+
+### Backend
+- Node.js with Express
+- yt-dlp for video downloading
+- Real-time progress tracking
+- File system storage
+
+## Project Structure
+
+```
+├── src/
+│   ├── components/          # React components
+│   ├── services/           # API service layer
+│   └── App.tsx            # Main application
+├── server/
+│   └── index.js           # Backend server
+└── package.json
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+## License
+
+This project is for educational purposes. Please respect copyright laws and platform terms of service when downloading content.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **yt-dlp not found**: Make sure yt-dlp is installed globally with `pip install yt-dlp`
+2. **Download fails**: Check if the video URL is valid and accessible
+3. **CORS errors**: Make sure both frontend and backend are running on the correct ports
+
+### Support
+
+For issues and questions, please check the troubleshooting section or create an issue in the repository.
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\tailwind.config.js ===
+/** @type {import('tailwindcss').Config} */
+    export default {
+      content: [
+        './index.html',
+        './src/**/*.{js,ts,jsx,tsx}',
+      ],
+      darkMode: 'class',
+      theme: {
+        extend: {},
+      },
+      plugins: [],
+    }
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\test.mp4.webm ===
+[Error reading file]: 'utf-8' codec can't decode byte 0x9f in position 4: invalid start byte
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\tsconfig.app.json ===
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"]
+}
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\tsconfig.json ===
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\tsconfig.node.json ===
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["vite.config.ts"]
+}
+
+
+=== File: C:\Users\Dell\Downloads\yt-downloader-sucess\project\vite.config.ts ===
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  optimizeDeps: {
+    exclude: ['lucide-react'],
+  },
+});
