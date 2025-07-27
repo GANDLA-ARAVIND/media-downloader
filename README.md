@@ -29,7 +29,7 @@ after completing the download in the download and batch download page it automat
 there is a login option so that user can save his data
 ![login](screenshots/login.png)
 
-we can the settings in settings page
+we can see the settings in settings page
 ![settings](screenshots/settings.png)
 
 
